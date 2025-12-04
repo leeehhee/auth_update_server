@@ -8,24 +8,30 @@ import bcrypt
 import secrets
 from datetime import datetime, timedelta
 
-app = FastAPI(title="Auth + Update + Log + File Server")
+app = FastAPI(title="Auth + Update + BOM Server")
 
 DB_PATH = "auth_update.db"
 UPLOAD_DIR = "uploaded_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+# ==========================
+# DB 연결
+# ==========================
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+# ==========================
+# DB 테이블 생성
+# ==========================
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # 사용자
+    # 사용자 계정
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,7 +42,7 @@ def init_db():
     )
     """)
 
-    # 앱 버전
+    # 앱 업데이트 정보
     cur.execute("""
     CREATE TABLE IF NOT EXISTS apps (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +54,7 @@ def init_db():
     )
     """)
 
-    # 세션
+    # 로그인 세션
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +78,7 @@ def init_db():
     )
     """)
 
-    # 첨부 파일
+    # 첨부파일
     cur.execute("""
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,14 +91,57 @@ def init_db():
     )
     """)
 
+    # =====================
+    # 🔥 여기서부터 중요: BOM 시스템
+    # =====================
+
+    # 제품
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT
+    )
+    """)
+
+    # BOM
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bom_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        spec TEXT,
+        length REAL,
+        width REAL,
+        height REAL,
+        material TEXT,
+        option TEXT,
+        qty INTEGER,
+        unit_price REAL,
+        FOREIGN KEY(product_id) REFERENCES products(id)
+    )
+    """)
+
+    # 계정 ↔ 제품 연결
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(product_id) REFERENCES products(id)
+    )
+    """)
+
     conn.commit()
     conn.close()
 
 
 init_db()
 
-
-# ---------- 모델 ----------
+# ==========================================================
+# Models
+# ==========================================================
 
 class LoginRequest(BaseModel):
     app_name: str
@@ -112,56 +161,19 @@ class LoginResponse(BaseModel):
     message: Optional[str] = None
 
 
-class LogEventRequest(BaseModel):
-    token: Optional[str] = None
-    app_name: str
-    action: str
-    detail: Optional[str] = None
-
-
-class UpdateInfoResponse(BaseModel):
-    latest_version: str
-    must_update: bool
-    download_url: str
-    release_notes: Optional[str] = None
-
-
-class UserListRequest(BaseModel):
-    token: str
-
-
-class UserCreateRequest(BaseModel):
-    token: str
-    username: str
-    password: str
-    role: str = "user"
-
-
-class UserDeleteRequest(BaseModel):
-    token: str
-    username: str
-
-
-class FileListRequest(BaseModel):
-    token: str
-
-
-class FileDeleteRequest(BaseModel):
-    token: str
-    file_id: int
-
-
-# ---------- 공통 함수 ----------
-
-def create_session(user_id: int) -> str:
+# ==========================================================
+# 인증/유틸 함수
+# ==========================================================
+def create_session(user_id: int):
     conn = get_db()
     cur = conn.cursor()
     token = secrets.token_hex(32)
     now = datetime.utcnow()
     expires = now + timedelta(days=7)
+
     cur.execute("""
-        INSERT INTO sessions (user_id, token, created_at, expires_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO sessions (user_id,token,created_at,expires_at)
+        VALUES (?,?,?,?)
     """, (user_id, token, now.isoformat(), expires.isoformat()))
     conn.commit()
     conn.close()
@@ -169,20 +181,18 @@ def create_session(user_id: int) -> str:
 
 
 def get_user_by_token(token: str):
-    if not token:
-        return None
     conn = get_db()
     cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
     cur.execute("""
         SELECT u.*
-        FROM sessions s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.token = ? AND s.expires_at > ?
-    """, (token, now))
-    row = cur.fetchone()
+          FROM sessions s
+          JOIN users u ON u.id = s.user_id
+         WHERE s.token = ?
+           AND s.expires_at > ?
+    """, (token, datetime.utcnow().isoformat()))
+    user = cur.fetchone()
     conn.close()
-    return row
+    return user
 
 
 def require_user(token: str):
@@ -195,59 +205,44 @@ def require_user(token: str):
 def require_admin(token: str):
     user = require_user(token)
     if user["role"] != "admin":
-        raise HTTPException(403, "관리자만 사용할 수 있습니다.")
+        raise HTTPException(403, "관리자만 사용 가능")
     return user
 
 
-def log_event(user_id, app_name, action, detail):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO logs(user_id, app_name, action, detail, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (user_id, app_name, action, detail, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-
-# ---------- 기본 API (로그인 / 업데이트 / 로그) ----------
-
+# ==========================================================
+# LOGIN
+# ==========================================================
 @app.post("/api/login", response_model=LoginResponse)
 def login(req: LoginRequest):
     conn = get_db()
     cur = conn.cursor()
-
-    cur.execute("SELECT * FROM users WHERE username=? AND is_active=1",
-                (req.username,))
+    cur.execute("SELECT * FROM users WHERE username=? AND is_active=1", (req.username,))
     user = cur.fetchone()
 
     if not user:
-        log_event(None, req.app_name, "login_fail", "no_user")
         return LoginResponse(result="fail", message="계정이 없습니다.")
 
-    if not bcrypt.checkpw(req.password.encode(),
-                          user["password_hash"].encode()):
-        log_event(user["id"], req.app_name, "login_fail", "wrong_password")
-        return LoginResponse(result="fail", message="비밀번호가 올바르지 않습니다.")
+    if not bcrypt.checkpw(req.password.encode(), user["password_hash"].encode()):
+        return LoginResponse(result="fail", message="비밀번호 오류")
 
     token = create_session(user["id"])
-    log_event(user["id"], req.app_name, "login_success",
-              f"version={req.app_version}")
 
+    # 버전 확인
     cur.execute("SELECT * FROM apps WHERE name=?", (req.app_name,))
     app_row = cur.fetchone()
     conn.close()
 
     must_update = False
-    latest_version = None
-    download_url = None
-    release_notes = None
+    latest = None
+    url = None
+    notes = None
 
     if app_row:
-        latest_version = app_row["latest_version"]
-        download_url = app_row["download_url"]
-        release_notes = app_row["release_notes"]
-        if req.app_version != latest_version:
+        latest = app_row["latest_version"]
+        url = app_row["download_url"]
+        notes = app_row["release_notes"]
+
+        if req.app_version != latest:
             must_update = bool(app_row["force_update"])
 
     return LoginResponse(
@@ -255,239 +250,130 @@ def login(req: LoginRequest):
         token=token,
         role=user["role"],
         must_update=must_update,
-        latest_version=latest_version,
-        download_url=download_url,
-        release_notes=release_notes
+        latest_version=latest,
+        download_url=url,
+        release_notes=notes
     )
 
 
-@app.get("/api/check_update", response_model=UpdateInfoResponse)
-def check_update(app_name: str, version: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM apps WHERE name=?", (app_name,))
-    app_row = cur.fetchone()
-    conn.close()
+# ==========================================================
+# -------------------- 제품 / BOM API -----------------------
+# ==========================================================
 
-    if not app_row:
-        raise HTTPException(404, "앱 정보가 없습니다.")
-
-    latest_version = app_row["latest_version"]
-    must_update = (version != latest_version) and bool(app_row["force_update"])
-
-    return UpdateInfoResponse(
-        latest_version=latest_version,
-        must_update=must_update,
-        download_url=app_row["download_url"],
-        release_notes=app_row["release_notes"]
-    )
-
-
-@app.post("/api/log_event")
-def log_event_endpoint(req: LogEventRequest):
-    user_id = None
-    if req.token:
-        user = get_user_by_token(req.token)
-        if user:
-            user_id = user["id"]
-    log_event(user_id, req.app_name, req.action, req.detail)
-    return {"result": "ok"}
-
-
-# ---------- 관리자 계정 최초 생성 ----------
-
-@app.post("/api/admin/create")
-def create_admin(username: str, password: str):
-    conn = get_db()
-    cur = conn.cursor()
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    cur.execute("""
-        INSERT INTO users(username,password_hash,role)
-        VALUES(?, ?, 'admin')
-    """, (username, hashed))
-    conn.commit()
-    conn.close()
-    return {"result": "admin created 👍"}
-
-
-# ---------- 사용자(타업체 계정) 관리 ----------
-
-@app.post("/api/users/list")
-def api_users_list(req: UserListRequest):
-    admin = require_admin(req.token)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT username, role, is_active FROM users ORDER BY username")
-    rows = cur.fetchall()
-    conn.close()
-    users = [
-        {
-            "username": r["username"],
-            "role": r["role"],
-            "is_active": bool(r["is_active"])
-        } for r in rows
-    ]
-    return {"users": users}
-
-
-@app.post("/api/users/create")
-def api_user_create(req: UserCreateRequest):
-    admin = require_admin(req.token)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE username=?", (req.username,))
-    if cur.fetchone():
-        conn.close()
-        raise HTTPException(400, "이미 존재하는 계정입니다.")
-    hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
-    cur.execute("""
-        INSERT INTO users(username,password_hash,role,is_active)
-        VALUES(?,?,?,1)
-    """, (req.username, hashed, req.role))
-    conn.commit()
-    conn.close()
-    return {"result": "ok"}
-
-
-@app.post("/api/users/delete")
-def api_user_delete(req: UserDeleteRequest):
-    admin = require_admin(req.token)
-    if admin["username"] == req.username:
-        raise HTTPException(400, "자기 자신의 계정은 삭제할 수 없습니다.")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE username=?", (req.username,))
-    conn.commit()
-    conn.close()
-    return {"result": "ok"}
-
-
-# ---------- 파일(첨부) 관리 ----------
-
-@app.post("/api/files/list")
-def api_files_list(req: FileListRequest):
-    user = require_user(req.token)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT f.id, f.filename, f.description, f.uploaded_at,
-               u.username AS uploaded_by
-        FROM files f
-        LEFT JOIN users u ON u.id = f.uploaded_by
-        ORDER BY f.id DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    files = [
-        {
-            "id": r["id"],
-            "filename": r["filename"],
-            "description": r["description"],
-            "uploaded_at": r["uploaded_at"],
-            "uploaded_by": r["uploaded_by"],
-        }
-        for r in rows
-    ]
-    return {"files": files}
-
-
-@app.post("/api/files/delete")
-def api_files_delete(req: FileDeleteRequest):
-    admin = require_admin(req.token)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT stored_path FROM files WHERE id=?", (req.file_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "파일을 찾을 수 없습니다.")
-    stored_path = row["stored_path"]
-    try:
-        if os.path.exists(stored_path):
-            os.remove(stored_path)
-    except Exception:
-        pass
-    cur.execute("DELETE FROM files WHERE id=?", (req.file_id,))
-    conn.commit()
-    conn.close()
-    return {"result": "ok"}
-
-
-@app.post("/api/files/upload")
-async def api_files_upload(
-    token: str = Form(...),
-    description: str = Form(""),
-    file: UploadFile = File(...)
-):
-    admin = require_admin(token)
-    safe_name = os.path.basename(file.filename)
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    stored_name = f"{ts}_{safe_name}"
-    stored_path = os.path.join(UPLOAD_DIR, stored_name)
-
-    with open(stored_path, "wb") as f:
-        f.write(await file.read())
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO files(filename,stored_path,description,uploaded_by,uploaded_at)
-        VALUES(?,?,?,?,?)
-    """, (safe_name, stored_path, description, admin["id"], datetime.utcnow().isoformat()))
-    conn.commit()
-    file_id = cur.lastrowid
-    conn.close()
-    return {"result": "ok", "file_id": file_id}
-
-
-@app.post("/api/files/update")
-async def api_files_update(
-    file_id: int = Form(...),
-    token: str = Form(...),
-    description: str = Form(""),
-    file: UploadFile = File(...)
-):
+# ------------------ 1) 제품 생성 (관리자)
+@app.post("/api/products/create")
+def api_product_create(token: str, name: str, description: str = ""):
     admin = require_admin(token)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT stored_path FROM files WHERE id=?", (file_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "파일을 찾을 수 없습니다.")
-    old_path = row["stored_path"]
-    try:
-        if os.path.exists(old_path):
-            os.remove(old_path)
-    except Exception:
-        pass
-
-    safe_name = os.path.basename(file.filename)
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    stored_name = f"{ts}_{safe_name}"
-    stored_path = os.path.join(UPLOAD_DIR, stored_name)
-    with open(stored_path, "wb") as f:
-        f.write(await file.read())
-
-    cur.execute("""
-        UPDATE files
-           SET filename=?, stored_path=?, description=?, uploaded_by=?, uploaded_at=?
-         WHERE id=?
-    """, (safe_name, stored_path, description, admin["id"], datetime.utcnow().isoformat(), file_id))
+    cur.execute("INSERT INTO products(name,description) VALUES(?,?)", (name, description))
     conn.commit()
     conn.close()
     return {"result": "ok"}
 
 
-@app.get("/api/files/download/{file_id}")
-def api_files_download(file_id: int, token: str):
+# ------------------ 2) 제품 목록 조회(관리자 전체)
+@app.get("/api/products/all")
+def api_products_all(token: str):
+    admin = require_admin(token)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products")
+    rows = cur.fetchall()
+    conn.close()
+    return {"products": [dict(r) for r in rows]}
+
+
+# ------------------ 3) 사용자에게 허용된 제품 목록
+@app.get("/api/user/products")
+def api_user_products(token: str):
     user = require_user(token)
+
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT filename, stored_path FROM files WHERE id=?", (file_id,))
-    row = cur.fetchone()
+    cur.execute("""
+        SELECT p.id, p.name, p.description
+          FROM user_products up
+          JOIN products p ON p.id = up.product_id
+         WHERE up.user_id = ?
+    """, (user["id"],))
+    rows = cur.fetchall()
     conn.close()
-    if not row:
-        raise HTTPException(404, "파일을 찾을 수 없습니다.")
 
-    return FileResponse(row["stored_path"], filename=row["filename"])
+    return {"products": [dict(r) for r in rows]}
+
+
+# ------------------ 4) BOM 추가 (관리자 전용)
+@app.post("/api/product/{pid}/bom/add")
+def api_bom_add(
+        pid: int,
+        token: str,
+        name: str,
+        spec: str = "",
+        length: float = 0,
+        width: float = 0,
+        height: float = 0,
+        material: str = "",
+        option: str = "",
+        qty: int = 0,
+        unit_price: float = 0):
+    admin = require_admin(token)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO bom_items(product_id,name,spec,length,width,height,material,option,qty,unit_price)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+    """, (pid, name, spec, length, width, height, material, option, qty, unit_price))
+    conn.commit()
+    conn.close()
+
+    return {"result": "ok"}
+
+
+# ------------------ 5) 제품 BOM 조회 (사용자 권한 체크)
+@app.get("/api/product/{pid}/bom")
+def api_product_bom(pid: int, token: str):
+    user = require_user(token)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # 접근권한 검사
+    cur.execute("""
+        SELECT 1 FROM user_products
+         WHERE user_id=? AND product_id=?
+    """, (user["id"], pid))
+    allow = cur.fetchone()
+    if not allow:
+        raise HTTPException(403, "이 제품에 대한 접근권한이 없습니다.")
+
+    cur.execute("""
+        SELECT name,spec,length,width,height,material,option,qty,unit_price
+        FROM bom_items
+        WHERE product_id=?
+    """, (pid,))
+    rows = cur.fetchall()
+    conn.close()
+
+    return {"bom": [dict(r) for r in rows]}
+
+
+# ------------------ 6) 사용자 ↔ 제품 연결 (관리자)
+@app.post("/api/user/link_product")
+def api_user_link_product(token: str, username: str, product_id: int):
+    admin = require_admin(token)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM users WHERE username=?", (username,))
+    u = cur.fetchone()
+    if not u:
+        raise HTTPException(404, "사용자 없음")
+
+    cur.execute("INSERT INTO user_products(user_id,product_id) VALUES(?,?)", (u["id"], product_id))
+    conn.commit()
+    conn.close()
+
+    return {"result": "ok"}
