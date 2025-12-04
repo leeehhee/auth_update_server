@@ -1,5 +1,8 @@
-fastapi==0.103.0
-uvicorn==0.23.0
-bcrypt==4.0.1
-python-multipart==0.0.6
-pydantic==1.10.9
+fastapi==0.115.0
+uvicorn==0.30.6
+bcrypt==4.1.2
+python-multipart==0.0.9
+pydantic==2.8.2
+pydantic-settings==2.2.1
+typing_extensions==4.12.2
+requests==2.32.3
